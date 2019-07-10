@@ -3,7 +3,7 @@
 //! Creates an interactive terminal window, providing a few functions useful to
 //! test Sunrise. Type help followed by enter to get a list of allowed commands.
 
-#![feature(asm, naked_functions)]
+#![feature(asm, naked_functions, thread_local, test)]
 #![no_std]
 
 // rustc warnings
@@ -204,6 +204,7 @@ capabilities!(CAPABILITIES = Capabilities {
         libuser::syscalls::nr::CloseHandle,
         libuser::syscalls::nr::WaitSynchronization,
         libuser::syscalls::nr::OutputDebugString,
+        libuser::syscalls::nr::SetThreadArea,
 
         libuser::syscalls::nr::SetHeapSize,
         libuser::syscalls::nr::QueryMemory,

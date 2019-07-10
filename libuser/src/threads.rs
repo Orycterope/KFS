@@ -59,11 +59,15 @@
 use crate::types::Thread as ThreadHandle;
 use crate::syscalls;
 use crate::error::Error;
+use crate::crt0::relocation::{module_header, ModuleHeader};
 use sunrise_libkern::{TLS, IpcBuffer};
 use alloc::boxed::Box;
-use core::mem::ManuallyDrop;
+use core::mem::{ManuallyDrop, align_of};
 use core::fmt;
 use spin::Once;
+use core::mem::size_of;
+use alloc::alloc::{alloc_zeroed, dealloc, Layout};
+use bitfield::fmt::Debug;
 
 /// Size of a thread's stack, in bytes.
 const STACK_SIZE: usize = 0x8000;
@@ -84,6 +88,7 @@ pub struct ThreadContext {
     ///
     /// `Some` for every other thread.
     stack: Option<Box<[u8; STACK_SIZE]>>,
+    tls: Once<TlsStaticArea>,
     /// The ThreadHandle of this thread.
     ///
     /// The thread needs to be able to access its own ThreadHandle at anytime
@@ -97,6 +102,7 @@ impl fmt::Debug for ThreadContext {
             .field("entry_point", &self.entry_point)
             .field("arg", &self.arg)
             .field("stack_address", &(self.stack.as_ref().map(|v| v as *const _ as usize).unwrap_or(0)))
+            .field("tls", &self.tls)
             .field("thread_handle", &self.thread_handle)
             .finish()
     }
@@ -120,6 +126,7 @@ static MAIN_THREAD_CONTEXT: ThreadContext = ThreadContext {
     entry_point: |_| { },
     arg: 0,
     stack: None,
+    tls: Once::new(), // will be initialised at startup.
     thread_handle: Once::new(), // will be initialized at startup.
 };
 
@@ -180,14 +187,22 @@ impl Thread {
 
     /// Allocates resources for a thread. To start it, call [`start`].
     ///
-    /// Allocates the stack, sets up the context, and calls `svcCreateThread`.
+    /// Allocates the stack, sets up the context and TLS, and calls `svcCreateThread`.
     ///
     /// [`start`]: Thread::start
     pub fn create(entry: fn (usize) -> (), arg: usize) -> Result<Self, Error> {
+        // copy tls static area
+        let static_blocks_start = unsafe { (&module_header as *const _ as usize + module_header.tls_start as usize) as *const u8 };
+        let static_blocks_len = unsafe { (module_header.tls_end - module_header.tls_start) as usize };
+        let tls_static_area = unsafe { TlsStaticArea::allocate(static_blocks_start, static_blocks_len) };
+        let tls = Once::new();
+        tls.call_once( move || tls_static_area);
+        // allocate a context
         let context = ManuallyDrop::new(Box::new(ThreadContext {
             entry_point: entry,
             arg,
             stack: Some(box [0u8; STACK_SIZE]),
+            tls: tls,
             thread_handle: Once::new(), // will be rewritten in a second
         }));
         match syscalls::create_thread(
@@ -232,6 +247,12 @@ extern "fastcall" fn thread_trampoline(thread_context_addr: usize) -> ! {
 
     let thread_context_addr = thread_context_addr as *mut ThreadContext;
 
+    // make gs point to our tls
+    unsafe {
+        syscalls::set_thread_area((*thread_context_addr).tls.r#try().unwrap().tcb() as usize)
+            .expect("cannot set thread area");
+    };
+
     // call the routine saved in the context, passing it the arg saved in the context
     unsafe {
         ((*thread_context_addr).entry_point)((*thread_context_addr).arg)
@@ -252,6 +273,89 @@ impl Drop for Thread {
     }
 }
 
+/// Elf TLS TCB
+///
+/// The variant II leaves the specification of the ThreadControlBlock (TCB) to the implementor,
+/// with the only requirement that the first word in the TCB, pointed by `tp`, contains its own
+/// address, i.e. is a pointer to itself (GNU variant).
+///
+/// We don't need to store anything else in the TCB, we use the [ThreadContext] for that,
+/// so on Sunrise it's just the self pointer.
+#[repr(C)]
+#[derive(Debug)]
+struct ThreadControlBlock {
+    /// Pointer containing its own address.
+    tp_self_ptr: *const ThreadControlBlock,
+    // todo dtv
+}
+
+/// Elf TLS static blocks and TCB.
+///
+/// The variant II specifies a memory area pointed to by `tp`, containing the tls blocks for static
+/// modules followed by a implementation-defined [ThreadControlBlock] (TCB).
+///
+/// This memory area is dynamically allocated for every thread we create.
+///
+/// Because the layout is so specific, and the tls blocks's length not statically known, it is not
+/// easily representable by a type. This makes it not suitable for a Box<T> allocation, we instead
+/// choose to call the allocator directly.
+///
+/// This type acts as a Box, it represents the allocated memory area, and dropping it frees this area.
+struct TlsStaticArea {
+    /// The address of the allocated memory area.
+    address: usize,
+    /// The layout used by alloc. Will be passed again to dealloc.
+    layout: Layout,
+}
+
+impl TlsStaticArea {
+    unsafe fn allocate(static_blocks_addr: *const u8, static_blocks_len: usize) -> Self {
+        // todo properly align blocks
+        // todo properly align TCB
+        let layout = Layout::from_size_align(static_blocks_len + size_of::<ThreadControlBlock>(),
+                                             align_of::<ThreadControlBlock>()).unwrap();
+        let area = alloc_zeroed(layout);
+        assert!(!area.is_null(), "Failed to allocate TLS static area");
+
+        // copy the static blocks in our area
+        core::ptr::copy(static_blocks_addr, area, static_blocks_len);
+        // write the TCB in the area
+        let tcb_addr = area.add(static_blocks_len) as *mut ThreadControlBlock;
+        let tcb = ThreadControlBlock {
+            tp_self_ptr: tcb_addr,
+        };
+        tcb_addr.write(tcb);
+        Self {
+            address: area as usize,
+            layout: layout,
+        }
+    }
+
+    fn tcb(&self) -> *const ThreadControlBlock {
+        (unsafe {
+            (self.address as *const u8).add(self.layout.size() - size_of::<ThreadControlBlock>())
+            // safe: guaranteed to be inside the allocation.
+        }) as *const ThreadControlBlock
+    }
+}
+
+impl Drop for TlsStaticArea {
+    /// Dropping a TlsStaticArea frees its memory area.
+    fn drop(&mut self) {
+        unsafe { dealloc(self.address as *mut u8, self.layout); }
+    }
+}
+
+impl Debug for TlsStaticArea {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> Result<(), core::fmt::Error> {
+        f.debug_struct("TlsStaticArea")
+            .field("start_address", &self.address)
+            .field("tcb_address", &self.tcb())
+            .field("total_size", &self.layout.size())
+            .finish()
+    }
+}
+
 /// Initialisation of the main thread's thread local structures:
 ///
 /// When a main thread starts, the kernel puts the handle of its own thread in one of its registers.
@@ -266,4 +370,32 @@ pub extern fn init_main_thread(handle: ThreadHandle) {
     MAIN_THREAD_CONTEXT.thread_handle.call_once(|| handle);
     // save the address of our context in our TLS region
     unsafe { (*get_my_tls_region()).ptr_thread_context = &MAIN_THREAD_CONTEXT as *const ThreadContext as usize };
+
+    let static_blocks_start = unsafe { (&module_header as *const _ as usize + module_header.tls_start as usize) as *const u8 };
+    let static_blocks_len = unsafe { (module_header.tls_end - module_header.tls_start) as usize };
+
+    let static_area = unsafe {
+        TlsStaticArea::allocate(static_blocks_start, static_blocks_len)
+    };
+
+    syscalls::set_thread_area(static_area.tcb() as usize)
+        .expect("Cannot set thread area for main thread");
+
+    // todo store it in our context
+    core::mem::forget(static_area);
+
+    /*let off0: usize;
+    let off4: usize;
+    let off8: usize;
+    unsafe {
+        asm!("
+        mov $0, gs:0
+        mov $1, gs:0xfffffffc
+        mov $2, gs:0xfffffff8
+        "
+        : "=r"(off0), "=r"(off4), "=r"(off8) ::: "intel", "volatile");
+    }
+
+    let a = 42;
+    */
 }

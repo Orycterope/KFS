@@ -9,6 +9,7 @@ PHDRS
   data PT_LOAD FLAGS(6);
   bss PT_LOAD FLAGS(6);
   dynamic PT_DYNAMIC;
+  tls PT_TLS;
 }
 
 SECTIONS
@@ -130,14 +131,18 @@ SECTIONS
 
   /* Thread Local sections */
 
+  __tls_start__ = .;
+
   .tdata : {
     *(.tdata .tdata.*)
-  } :data
+  } :tls :data
 
   .tbss : {
     *(.tbss .tbss.*)
     *(.tcommon)
-  } :data
+  } :tls :data
+
+  __tls_end__ = .;
 
   /* BSS section */
   . = ALIGN(0x1000);
